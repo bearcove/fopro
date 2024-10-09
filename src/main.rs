@@ -1,5 +1,9 @@
 use color_eyre::eyre;
 use std::str::FromStr;
+use tokio::{
+    io::AsyncReadExt,
+    net::{TcpListener, TcpStream},
+};
 
 use tracing_subscriber::{
     filter::Targets, layer::SubscriberExt, util::SubscriberInitExt, Layer, Registry,
@@ -23,7 +27,27 @@ async fn main() -> eyre::Result<()> {
 
     let host = "127.0.0.1";
     let port = 8080;
-    tracing::info!("Starting server on {host}:{port}");
+
+    let ln = TcpListener::bind(format!("{host}:{port}")).await?;
+    tracing::info!("Listening on {host}:{port}");
+
+    while let Ok((stream, remote_addr)) = ln.accept().await {
+        tracing::debug!("Accepted connection from {remote_addr}");
+        tokio::spawn(async move {
+            if let Err(e) = handle_stream(stream).await {
+                tracing::error!("Error handling stream: {e}")
+            }
+        });
+    }
 
     Ok(())
+}
+
+async fn handle_stream(mut stream: TcpStream) -> eyre::Result<()> {
+    let mut buf = vec![0; 1024];
+    let n = stream.read(&mut buf).await?;
+    let read_slice = &buf[..n];
+    tracing::debug!("Received:\n{}", pretty_hex::pretty_hex(&read_slice));
+
+    eyre::bail!("Not implemented");
 }

@@ -126,6 +126,7 @@ version = "0.1.0"
 dependencies = [
  "color-eyre",
  "hyper",
+ "pretty-hex",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -408,6 +409,12 @@ name = "pin-utils"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
+
+[[package]]
+name = "pretty-hex"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbc83ee4a840062f368f9096d80077a9841ec117e17e7f700df81958f1451254"
 
 [[package]]
 name = "proc-macro2"
