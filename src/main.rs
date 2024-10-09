@@ -20,9 +20,6 @@ use tracing_subscriber::{
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
-    tokio_rustls::rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("we should be the first provider to install");
 
     let rust_log_var = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     let log_filter = Targets::from_str(&rust_log_var)?;
@@ -239,16 +236,42 @@ async fn proxy_request<ReqBody: Body + Send + Sync + Debug>(
             .unwrap());
     }
 
-    let upstream_res = settings
+    let upstream_res = match settings
         .client
         .request(req.method().clone(), uri.to_string())
         .send()
-        .await;
+        .await
+    {
+        Ok(res) => res,
+        Err(e) => {
+            tracing::error!("Error sending request: {e}");
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Bytes::copy_from_slice(format!("{e}").as_bytes()).into())
+                .unwrap());
+        }
+    };
 
     tracing::debug!("Upstream response: {upstream_res:?}");
 
+    let status = upstream_res.status();
+    let headers = upstream_res.headers().clone();
+
+    // collect the body as bytes
+    let body = match upstream_res.bytes().await {
+        Ok(res) => res,
+        Err(e) => {
+            tracing::error!("Error reading upstream response body: {e}");
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Bytes::copy_from_slice(format!("{e}").as_bytes()).into())
+                .unwrap());
+        }
+    };
+
     Ok(Response::builder()
-        .status(StatusCode::NOT_IMPLEMENTED)
-        .body(Bytes::new().into())
+        .status(status)
+        .extension(headers)
+        .body(body.into())
         .unwrap())
 }
