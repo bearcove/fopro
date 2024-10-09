@@ -20,6 +20,9 @@ use tracing_subscriber::{
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
+    tokio_rustls::rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("we should be the first provider to install");
 
     let rust_log_var = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     let log_filter = Targets::from_str(&rust_log_var)?;
@@ -39,10 +42,18 @@ async fn main() -> eyre::Result<()> {
     let ln = TcpListener::bind(format!("{host}:{port}")).await?;
     tracing::info!("Listening on {host}:{port}");
 
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .use_rustls_tls()
+        .user_agent("fopro/1.0 — https://github.com/bearcove/fopro")
+        .build()?;
+    let service = UpgradeService { client };
+
     while let Ok((stream, remote_addr)) = ln.accept().await {
         tracing::debug!("Accepted connection from {remote_addr}");
+        let service = service.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_stream(stream).await {
+            if let Err(e) = handle_stream(stream, service).await {
                 tracing::error!("Error handling stream: {e}")
             }
         });
@@ -51,16 +62,19 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-async fn handle_stream(stream: TcpStream) -> eyre::Result<()> {
+async fn handle_stream(stream: TcpStream, service: UpgradeService) -> eyre::Result<()> {
     let stream = TokioIo::new(stream);
     let conn = conn::http1::Builder::new()
-        .serve_connection(stream, UpgradeService)
+        .serve_connection(stream, service)
         .with_upgrades();
     conn.await?;
     Ok(())
 }
 
-struct UpgradeService;
+#[derive(Clone)]
+struct UpgradeService {
+    client: reqwest::Client,
+}
 
 impl<ReqBody> Service<Request<ReqBody>> for UpgradeService
 where
@@ -71,6 +85,8 @@ where
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
     fn call(&self, req: Request<ReqBody>) -> Self::Future {
+        let client = self.client.clone();
+
         Box::pin(async move {
             if req.method() != Method::CONNECT {
                 return Ok(Response::builder()
@@ -82,9 +98,20 @@ where
             let uri = req.uri().clone();
             tracing::trace!("Got CONNECT to {uri}, headers = {:#?}", req.headers());
 
+            let host = match uri.host() {
+                Some(host) => host.to_string(),
+                None => {
+                    return Ok(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(String::from("expected host in CONNECT request"))
+                        .unwrap())
+                }
+            };
+            let settings = ProxySettings { host, client };
+
             let on_upgrade = hyper::upgrade::on(req);
             tokio::spawn(async move {
-                if let Err(e) = handle_upgraded_conn(uri, on_upgrade).await {
+                if let Err(e) = handle_upgraded_conn(uri, on_upgrade, settings).await {
                     tracing::error!("Error handling upgraded conn: {e:?}");
                 }
             });
@@ -99,7 +126,11 @@ where
     }
 }
 
-async fn handle_upgraded_conn(uri: Uri, on_upgrade: OnUpgrade) -> eyre::Result<()> {
+async fn handle_upgraded_conn(
+    uri: Uri,
+    on_upgrade: OnUpgrade,
+    settings: ProxySettings,
+) -> eyre::Result<()> {
     let c = on_upgrade.await.unwrap();
     let c = TokioIo::new(c);
 
@@ -129,7 +160,7 @@ async fn handle_upgraded_conn(uri: Uri, on_upgrade: OnUpgrade) -> eyre::Result<(
         );
     }
 
-    let service = ProxyService { host };
+    let service = ProxyService { settings };
     let conn = conn::http2::Builder::new(TokioExecutor::new())
         .serve_connection(TokioIo::new(tls_stream), service);
     conn.await?;
@@ -137,30 +168,87 @@ async fn handle_upgraded_conn(uri: Uri, on_upgrade: OnUpgrade) -> eyre::Result<(
     Ok(())
 }
 
-struct ProxyService {
-    // the host we're proxying to, e.g. `pypi.org`
+#[derive(Clone)]
+struct ProxySettings {
+    /// the host we're proxying to, e.g. `pypi.org`
     host: String,
+
+    /// the shared reqwest client for upstream
+    client: reqwest::Client,
+}
+
+impl std::fmt::Debug for ProxySettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxySettings")
+            .field("host", &self.host)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProxyService {
+    settings: ProxySettings,
 }
 
 impl<ReqBody> Service<Request<ReqBody>> for ProxyService
 where
-    ReqBody: Body + Debug + Send + 'static,
+    ReqBody: Body + Send + Sync + Debug + 'static,
 {
     type Response = Response<Full<Bytes>>;
     type Error = hyper::Error;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
     fn call(&self, req: Request<ReqBody>) -> Self::Future {
-        let host = self.host.clone();
+        let settings = self.settings.clone();
 
         Box::pin(async move {
-            let uri = req.uri().clone();
-            tracing::trace!(%host, %uri, "Should proxy request");
-
-            Ok(Response::builder()
-                .status(StatusCode::NOT_IMPLEMENTED)
-                .body(Bytes::new().into())
-                .unwrap())
+            match proxy_request(req, settings).await {
+                Ok(resp) => Ok(resp),
+                Err(e) => {
+                    tracing::error!("Error proxying request: {e}");
+                    Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Bytes::copy_from_slice(format!("{e}").as_bytes()).into())
+                        .unwrap())
+                }
+            }
         })
     }
+}
+
+async fn proxy_request<ReqBody: Body + Send + Sync + Debug>(
+    req: Request<ReqBody>,
+    settings: ProxySettings,
+) -> Result<Response<Full<Bytes>>, eyre::Error> {
+    let uri = req.uri().clone();
+    tracing::trace!(?settings, %uri, "Should proxy request");
+
+    let uri_host = uri
+        .host()
+        .ok_or_else(|| eyre::eyre!("expected host in CONNECT request"))?;
+
+    if uri_host != settings.host {
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(
+                Bytes::copy_from_slice(
+                    format!("expected host {settings:?}, got {uri_host}").as_bytes(),
+                )
+                .into(),
+            )
+            .unwrap());
+    }
+
+    let upstream_res = settings
+        .client
+        .request(req.method().clone(), uri.to_string())
+        .send()
+        .await;
+
+    tracing::debug!("Upstream response: {upstream_res:?}");
+
+    Ok(Response::builder()
+        .status(StatusCode::NOT_IMPLEMENTED)
+        .body(Bytes::new().into())
+        .unwrap())
 }
