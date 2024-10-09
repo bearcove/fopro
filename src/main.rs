@@ -162,10 +162,24 @@ async fn handle_upgraded_conn(
         .serve_connection(TokioIo::new(tls_stream), service);
     match conn.await {
         Ok(_) => (),
-        Err(e) if e.to_string().contains("broken pipe") => {
-            tracing::debug!("Connection closed (broken pipe): {}", e);
+        Err(e) => {
+            let mut current_error: &dyn std::error::Error = &e;
+            let mut is_broken_pipe = false;
+            while let Some(source) = current_error.source() {
+                if let Some(io_error) = source.downcast_ref::<std::io::Error>() {
+                    if io_error.kind() == std::io::ErrorKind::BrokenPipe {
+                        is_broken_pipe = true;
+                        break;
+                    }
+                }
+                current_error = source;
+            }
+            if is_broken_pipe {
+                tracing::debug!("Connection closed (broken pipe): {}", e);
+            } else {
+                return Err(e.into());
+            }
         }
-        Err(e) => return Err(e.into()),
     }
 
     Ok(())
