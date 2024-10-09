@@ -9,7 +9,7 @@ use hyper::{
     Method, Request, Response, StatusCode, Uri,
 };
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use std::{fmt::Debug, str::FromStr, sync::Arc};
+use std::{fmt::Debug, str::FromStr, sync::Arc, time::Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::{pki_types::PrivateKeyDer, ServerConfig};
 
@@ -160,7 +160,13 @@ async fn handle_upgraded_conn(
     let service = ProxyService { settings };
     let conn = conn::http2::Builder::new(TokioExecutor::new())
         .serve_connection(TokioIo::new(tls_stream), service);
-    conn.await?;
+    match conn.await {
+        Ok(_) => (),
+        Err(e) if e.to_string().contains("broken pipe") => {
+            tracing::debug!("Connection closed (broken pipe): {}", e);
+        }
+        Err(e) => return Err(e.into()),
+    }
 
     Ok(())
 }
@@ -190,6 +196,8 @@ struct ProxyService {
 impl<ReqBody> Service<Request<ReqBody>> for ProxyService
 where
     ReqBody: Body + Send + Sync + Debug + 'static,
+    <ReqBody as Body>::Data: Into<Bytes>,
+    <ReqBody as Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     type Response = Response<Full<Bytes>>;
     type Error = hyper::Error;
@@ -213,10 +221,15 @@ where
     }
 }
 
-async fn proxy_request<ReqBody: Body + Send + Sync + Debug>(
+async fn proxy_request<ReqBody>(
     req: Request<ReqBody>,
     settings: ProxySettings,
-) -> Result<Response<Full<Bytes>>, eyre::Error> {
+) -> Result<Response<Full<Bytes>>, eyre::Error>
+where
+    ReqBody: Body + Send + Sync + Debug + 'static,
+    <ReqBody as Body>::Data: Into<Bytes>,
+    <ReqBody as Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let uri = req.uri().clone();
     tracing::trace!(?settings, %uri, "Should proxy request");
 
@@ -236,9 +249,18 @@ async fn proxy_request<ReqBody: Body + Send + Sync + Debug>(
             .unwrap());
     }
 
+    let before_req = Instant::now();
+
+    let method = req.method().clone();
+    let (part, body) = req.into_parts();
+
+    tracing::debug!("Proxying {method} {uri}");
+
     let upstream_res = match settings
         .client
-        .request(req.method().clone(), uri.to_string())
+        .request(method.clone(), uri.to_string())
+        .body(reqwest::Body::wrap(body))
+        .headers(part.headers.clone())
         .send()
         .await
     {
@@ -252,10 +274,13 @@ async fn proxy_request<ReqBody: Body + Send + Sync + Debug>(
         }
     };
 
-    tracing::debug!("Upstream response: {upstream_res:?}");
+    let headers_elapsed = before_req.elapsed();
+    tracing::debug!(?headers_elapsed, "Upstream response: {upstream_res:?}");
 
     let status = upstream_res.status();
     let headers = upstream_res.headers().clone();
+
+    let before_body = Instant::now();
 
     // collect the body as bytes
     let body = match upstream_res.bytes().await {
@@ -269,9 +294,11 @@ async fn proxy_request<ReqBody: Body + Send + Sync + Debug>(
         }
     };
 
-    Ok(Response::builder()
-        .status(status)
-        .extension(headers)
-        .body(body.into())
-        .unwrap())
+    let body_elapsed = before_body.elapsed();
+
+    tracing::info!("Proxied {method} {uri} (headers {headers_elapsed:?} + body {body_elapsed:?})");
+
+    let mut res = Response::builder().status(status);
+    res.headers_mut().unwrap().extend(headers);
+    Ok(res.body(body.into()).unwrap())
 }

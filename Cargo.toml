@@ -7,7 +7,7 @@ edition = "2021"
 color-eyre = "0.6.3"
 futures-util = "0.3.31"
 http-body-util = "0.1.2"
-hyper = { version = "1.4.1", default-feature = false, features = [
+hyper = { version = "1.4.1", default-features = false, features = [
     "http1",
     "http2",
     "server",
