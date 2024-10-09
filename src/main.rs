@@ -1,10 +1,14 @@
 use color_eyre::eyre;
 use futures_util::future::BoxFuture;
+use http_body_util::Full;
 use hyper::{
-    body::Body, server::conn, service::Service, upgrade::OnUpgrade, Method, Request, Response,
-    StatusCode, Uri,
+    body::{Body, Bytes},
+    server::conn,
+    service::Service,
+    upgrade::OnUpgrade,
+    Method, Request, Response, StatusCode, Uri,
 };
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::{fmt::Debug, str::FromStr, sync::Arc};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::{pki_types::PrivateKeyDer, ServerConfig};
@@ -50,15 +54,15 @@ async fn main() -> eyre::Result<()> {
 async fn handle_stream(stream: TcpStream) -> eyre::Result<()> {
     let stream = TokioIo::new(stream);
     let conn = conn::http1::Builder::new()
-        .serve_connection(stream, ProxyService)
+        .serve_connection(stream, UpgradeService)
         .with_upgrades();
     conn.await?;
     Ok(())
 }
 
-struct ProxyService;
+struct UpgradeService;
 
-impl<ReqBody> Service<Request<ReqBody>> for ProxyService
+impl<ReqBody> Service<Request<ReqBody>> for UpgradeService
 where
     ReqBody: Body + Debug + Send + 'static,
 {
@@ -103,7 +107,7 @@ async fn handle_upgraded_conn(uri: Uri, on_upgrade: OnUpgrade) -> eyre::Result<(
         .host()
         .ok_or_else(|| eyre::eyre!("expected host in CONNECT request"))?
         .to_string();
-    let cert_key = rcgen::generate_simple_self_signed([host])?;
+    let cert_key = rcgen::generate_simple_self_signed([host.clone()])?;
 
     let mut server_conf = ServerConfig::builder()
         .with_no_client_auth()
@@ -116,14 +120,47 @@ async fn handle_upgraded_conn(uri: Uri, on_upgrade: OnUpgrade) -> eyre::Result<(
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_conf));
     let tls_stream = acceptor.accept(c).await?;
 
-    let (_stream, server_conn) = tls_stream.get_ref();
+    {
+        let (_stream, server_conn) = tls_stream.get_ref();
 
-    tracing::trace!(
-        "Negotiated TLS session, ALPN proto = {:?}",
-        server_conn
-            .alpn_protocol()
-            .map(|p| pretty_hex::pretty_hex(&p))
-    );
+        tracing::trace!(
+            "Negotiated TLS session, ALPN proto:\n{}",
+            pretty_hex::pretty_hex(&server_conn.alpn_protocol().unwrap_or_default())
+        );
+    }
+
+    let service = ProxyService { host };
+    let conn = conn::http2::Builder::new(TokioExecutor::new())
+        .serve_connection(TokioIo::new(tls_stream), service);
+    conn.await?;
 
     Ok(())
+}
+
+struct ProxyService {
+    // the host we're proxying to, e.g. `pypi.org`
+    host: String,
+}
+
+impl<ReqBody> Service<Request<ReqBody>> for ProxyService
+where
+    ReqBody: Body + Debug + Send + 'static,
+{
+    type Response = Response<Full<Bytes>>;
+    type Error = hyper::Error;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn call(&self, req: Request<ReqBody>) -> Self::Future {
+        let host = self.host.clone();
+
+        Box::pin(async move {
+            let uri = req.uri().clone();
+            tracing::trace!(%host, %uri, "Should proxy request");
+
+            Ok(Response::builder()
+                .status(StatusCode::NOT_IMPLEMENTED)
+                .body(Bytes::new().into())
+                .unwrap())
+        })
+    }
 }

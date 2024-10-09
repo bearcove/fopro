@@ -2,7 +2,7 @@ w:
     just watch
 
 watch:
-    cargo watch -E RUST_LOG=trace -x run
+    cargo watch -E RUST_LOG=info,fopro=trace -x run
 
 r:
     just run

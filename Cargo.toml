@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 color-eyre = "0.6.3"
 futures-util = "0.3.31"
+http-body-util = "0.1.2"
 hyper = { version = "1.4.1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1.9", features = ["tokio"] }
 pretty-hex = "0.4.1"
