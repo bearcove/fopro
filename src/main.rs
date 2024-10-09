@@ -2,14 +2,12 @@ use color_eyre::eyre;
 use futures_util::future::BoxFuture;
 use hyper::{
     body::Body, server::conn, service::Service, upgrade::OnUpgrade, Method, Request, Response,
-    StatusCode,
+    StatusCode, Uri,
 };
 use hyper_util::rt::TokioIo;
-use std::{fmt::Debug, str::FromStr};
-use tokio::{
-    io::AsyncReadExt,
-    net::{TcpListener, TcpStream},
-};
+use std::{fmt::Debug, str::FromStr, sync::Arc};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::rustls::{pki_types::PrivateKeyDer, ServerConfig};
 
 use tracing_subscriber::{
     filter::Targets, layer::SubscriberExt, util::SubscriberInitExt, Layer, Registry,
@@ -77,15 +75,12 @@ where
                     .unwrap());
             }
 
-            tracing::trace!(
-                "Got CONNECT to {}, headers = {:#?}",
-                req.uri(),
-                req.headers()
-            );
+            let uri = req.uri().clone();
+            tracing::trace!("Got CONNECT to {uri}, headers = {:#?}", req.headers());
 
             let on_upgrade = hyper::upgrade::on(req);
             tokio::spawn(async move {
-                if let Err(e) = handle_upgraded_conn(on_upgrade).await {
+                if let Err(e) = handle_upgraded_conn(uri, on_upgrade).await {
                     tracing::error!("Error handling upgraded conn: {e:?}");
                 }
             });
@@ -100,14 +95,35 @@ where
     }
 }
 
-async fn handle_upgraded_conn(on_upgrade: OnUpgrade) -> eyre::Result<()> {
+async fn handle_upgraded_conn(uri: Uri, on_upgrade: OnUpgrade) -> eyre::Result<()> {
     let c = on_upgrade.await.unwrap();
-    let mut c = TokioIo::new(c);
+    let c = TokioIo::new(c);
 
-    let mut buf = vec![0u8; 1024];
-    let n = c.read(&mut buf).await?;
-    let read_slice = &buf[..n];
-    tracing::trace!("Read: {}", pretty_hex::pretty_hex(&read_slice));
+    let host: String = uri
+        .host()
+        .ok_or_else(|| eyre::eyre!("expected host in CONNECT request"))?
+        .to_string();
+    let cert_key = rcgen::generate_simple_self_signed([host])?;
+
+    let mut server_conf = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert_key.cert.into()],
+            PrivateKeyDer::Pkcs8(cert_key.key_pair.serialize_der().into()),
+        )?;
+    server_conf.alpn_protocols.push(b"h2".to_vec());
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_conf));
+    let tls_stream = acceptor.accept(c).await?;
+
+    let (_stream, server_conn) = tls_stream.get_ref();
+
+    tracing::trace!(
+        "Negotiated TLS session, ALPN proto = {:?}",
+        server_conn
+            .alpn_protocol()
+            .map(|p| pretty_hex::pretty_hex(&p))
+    );
 
     Ok(())
 }
