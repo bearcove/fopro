@@ -314,13 +314,16 @@ where
 
                 let before_read = Instant::now();
 
-                let body = Full::new(Bytes::from(
-                    tokio::fs::read(&cache_path_on_disk).await?[cache_entry.body_offset as usize..]
-                        .to_vec(),
-                ));
+                let body = tokio::fs::read(&cache_path_on_disk).await?
+                    [cache_entry.body_offset as usize..]
+                    .to_vec();
+                let res_size = body.len();
+                let body = Full::new(Bytes::from(body));
 
                 let read_elapsed = before_read.elapsed();
-                tracing::info!("\x1b[32m[HIT!]\x1b[0m {method} {uri} (read {read_elapsed:?})");
+
+                let status = &cache_entry.header.response_status;
+                tracing::info!("\x1b[32m[HIT!]\x1b[0m {status} {res_size}B {method} {uri} (read {read_elapsed:?})");
 
                 return Ok(res.body(body).unwrap());
             }
@@ -373,10 +376,11 @@ where
                 .unwrap());
         }
     };
+    let res_size = body.len();
 
     let body_elapsed = before_body.elapsed();
     tracing::info!(
-        "\x1b[31m[MISS]\x1b[0m {method} {uri} (headers {headers_elapsed:?} + body {body_elapsed:?})"
+        "\x1b[31m[MISS]\x1b[0m {status} {res_size}B {method} {uri} (headers {headers_elapsed:?} + body {body_elapsed:?})"
     );
 
     if cachable {
