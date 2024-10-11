@@ -272,15 +272,28 @@ where
     let method = req.method().clone();
     let (part, body) = req.into_parts();
 
-    let cache_key = format!("{uri}");
-    let cache_key = cache_key.replace('/', "_SLASH_");
-    let cache_key = cache_key.replace('.', "_DOT_");
+    let cache_key = format!(
+        "{}{}",
+        uri.host().unwrap_or_default(),
+        uri.path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or_default()
+    );
     let cache_key = cache_key.replace(':', "_COLON_");
+    let cache_key = cache_key.replace("//", "_SLASHSLASH_");
+    if cache_key.contains("..") {
+        panic!("nope");
+    }
+    let cache_key = cache_key.strip_suffix('/').unwrap_or(&cache_key);
     tracing::info!("Cache key: {}", cache_key);
 
     let cache_dir = std::env::current_dir()?.join(".fopro-cache");
-    std::fs::create_dir_all(&cache_dir)?;
-    let cache_path_on_disk = cache_dir.join(&cache_key);
+    let cache_path_on_disk = cache_dir.join(cache_key);
+    tokio::fs::create_dir_all(cache_path_on_disk.parent().unwrap()).await?;
+    tracing::info!(
+        "Just made dir {}",
+        cache_path_on_disk.parent().unwrap().display()
+    );
 
     match tokio::fs::File::open(&cache_path_on_disk).await {
         Ok(mut file) => {
@@ -380,6 +393,8 @@ where
     file.flush().await?;
 
     // Rename the temporary file to the final cache file
+    tracing::info!("Just wrote temp file {}", temp_file.display(),);
+    tracing::info!("Will rename to {}", cache_path_on_disk.display());
     tokio::fs::rename(temp_file, cache_path_on_disk).await?;
 
     let cache_duration = cache_start.elapsed();
