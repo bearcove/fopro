@@ -6,11 +6,15 @@ use hyper::{
     server::conn,
     service::Service,
     upgrade::OnUpgrade,
-    Method, Request, Response, StatusCode, Uri,
+    HeaderMap, Method, Request, Response, StatusCode, Uri,
 };
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, str::FromStr, sync::Arc, time::Instant};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
 use tokio_rustls::rustls::{pki_types::PrivateKeyDer, ServerConfig};
 
 use tracing_subscriber::{
@@ -268,6 +272,45 @@ where
     let method = req.method().clone();
     let (part, body) = req.into_parts();
 
+    let cache_key = format!("{uri}");
+    let cache_key = cache_key.replace('/', "_SLASH_");
+    let cache_key = cache_key.replace('.', "_DOT_");
+    let cache_key = cache_key.replace(':', "_COLON_");
+    tracing::info!("Cache key: {}", cache_key);
+
+    let cache_dir = std::env::current_dir()?.join(".fopro-cache");
+    std::fs::create_dir_all(&cache_dir)?;
+    let cache_path_on_disk = cache_dir.join(&cache_key);
+
+    match tokio::fs::File::open(&cache_path_on_disk).await {
+        Ok(mut file) => {
+            tracing::info!("Cache hit: {}", cache_key);
+            let cache_entry = read_cache_entry(&mut file).await?;
+            let mut res = Response::builder().status(cache_entry.header.response_status);
+            res.headers_mut()
+                .unwrap()
+                .extend(cache_entry.header.response_headers);
+
+            let before_read = Instant::now();
+
+            let body = Full::new(Bytes::from(
+                tokio::fs::read(&cache_path_on_disk).await?[cache_entry.body_offset as usize..]
+                    .to_vec(),
+            ));
+
+            tracing::info!("Read body from cache in {:?}", before_read.elapsed());
+
+            return Ok(res.body(body).unwrap());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Cache miss, continue with the original request
+        }
+        Err(e) => {
+            // Unexpected error
+            return Err(e.into());
+        }
+    }
+
     tracing::debug!("Proxying {method} {uri}");
 
     let upstream_res = match settings
@@ -309,10 +352,79 @@ where
     };
 
     let body_elapsed = before_body.elapsed();
-
     tracing::info!("Proxied {method} {uri} (headers {headers_elapsed:?} + body {body_elapsed:?})");
+
+    // Measure caching time
+    let cache_start = Instant::now();
+
+    // Create cache entry
+    let cache_entry = CacheEntry {
+        header: CacheHeader {
+            response_status: status,
+            response_headers: headers.clone(),
+        },
+        body_offset: 0, // This will be updated when writing
+    };
+
+    // Write to a temporary file
+    let temp_file = cache_path_on_disk.with_extension("tmp");
+    let mut file = tokio::fs::File::create(&temp_file).await?;
+
+    // Write the cache entry
+    write_cache_entry(&mut file, cache_entry).await?;
+
+    // Write the body
+    file.write_all(&body).await?;
+
+    // Ensure all data is written to disk
+    file.flush().await?;
+
+    // Rename the temporary file to the final cache file
+    tokio::fs::rename(temp_file, cache_path_on_disk).await?;
+
+    let cache_duration = cache_start.elapsed();
+    tracing::info!("Cached response for {} in {:?}", cache_key, cache_duration);
 
     let mut res = Response::builder().status(status);
     res.headers_mut().unwrap().extend(headers);
     Ok(res.body(body.into()).unwrap())
+}
+
+struct CacheEntry {
+    header: CacheHeader,
+    body_offset: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CacheHeader {
+    #[serde(with = "http_serde::status_code")]
+    response_status: StatusCode,
+
+    #[serde(with = "http_serde::header_map")]
+    response_headers: HeaderMap,
+}
+
+async fn read_cache_entry(mut r: impl AsyncRead + Unpin) -> eyre::Result<CacheEntry> {
+    let mut buf = [0; 8];
+    tokio::io::AsyncReadExt::read_exact(&mut r, &mut buf).await?;
+    let header_len = u64::from_be_bytes(buf);
+
+    let mut header_buf = vec![0u8; header_len as usize];
+    tokio::io::AsyncReadExt::read_exact(&mut r, &mut header_buf).await?;
+    let header: CacheHeader = postcard::from_bytes(&header_buf)?;
+
+    Ok(CacheEntry {
+        header,
+        body_offset: 8 + header_len,
+    })
+}
+
+async fn write_cache_entry(mut w: impl AsyncWrite + Unpin, entry: CacheEntry) -> eyre::Result<()> {
+    let header_bytes = postcard::to_stdvec(&entry.header)?;
+    let header_len = header_bytes.len() as u64;
+
+    w.write_all(&header_len.to_be_bytes()).await?;
+    w.write_all(&header_bytes).await?;
+
+    Ok(())
 }

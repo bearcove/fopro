@@ -4,15 +4,18 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+byteorder = "1.5.0"
 color-eyre = "0.6.3"
 futures-util = "0.3.31"
 http-body-util = "0.1.2"
+http-serde = "2.1.1"
 hyper = { version = "1.4.1", default-features = false, features = [
     "http1",
     "http2",
     "server",
 ] }
 hyper-util = { version = "0.1.9", features = ["tokio"] }
+postcard = { version = "1.0.10", features = ["use-std"] }
 pretty-hex = "0.4.1"
 rcgen = { version = "0.13.1" }
 reqwest = { version = "0.12.8", default-features = false, features = [
@@ -21,6 +24,8 @@ reqwest = { version = "0.12.8", default-features = false, features = [
     "http2",
     "rustls-tls-webpki-roots",
 ] }
+serde = { version = "1.0.210", features = ["derive"] }
+serde_bytes = "0.11.15"
 tokio = { version = "1.40.0", features = ["full"] }
 tokio-rustls = { version = "0.26.0", default-features = false, features = [
     "tls12",
