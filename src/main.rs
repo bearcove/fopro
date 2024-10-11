@@ -390,7 +390,7 @@ where
         );
     }
 
-    if cachable && status.is_success() {
+    if cachable && status == StatusCode::OK {
         // Create cache entry
         let cache_entry = CacheEntry {
             header: CacheHeader {
