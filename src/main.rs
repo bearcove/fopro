@@ -289,7 +289,7 @@ where
     };
 
     let headers_elapsed = before_req.elapsed();
-    tracing::debug!(?headers_elapsed, "Upstream response: {upstream_res:?}");
+    tracing::debug!(?headers_elapsed, "Upstream response: {upstream_res:#?}");
 
     let status = upstream_res.status();
     let headers = upstream_res.headers().clone();
