@@ -322,8 +322,11 @@ where
 
                 let read_elapsed = before_read.elapsed();
 
-                let status = &cache_entry.header.response_status;
-                tracing::info!("\x1b[32m[HIT!]\x1b[0m {status} {res_size}B {method} {uri} (read {read_elapsed:?})");
+                {
+                    let status = cache_entry.header.response_status;
+                    let status = format_status(status);
+                    tracing::info!("\x1b[32m[HIT!]\x1b[0m {status} {res_size}B {method} {uri} (read {read_elapsed:?})");
+                }
 
                 return Ok(res.body(body).unwrap());
             }
@@ -379,9 +382,12 @@ where
     let res_size = body.len();
 
     let body_elapsed = before_body.elapsed();
-    tracing::info!(
-        "\x1b[31m[MISS]\x1b[0m {status} {res_size}B {method} {uri} (headers {headers_elapsed:?} + body {body_elapsed:?})"
-    );
+    {
+        let status = format_status(status);
+        tracing::info!(
+            "\x1b[31m[MISS]\x1b[0m {status} {res_size}B {method} {uri} (headers {headers_elapsed:?} + body {body_elapsed:?})"
+        );
+    }
 
     if cachable {
         // Create cache entry
@@ -452,4 +458,11 @@ async fn write_cache_entry(mut w: impl AsyncWrite + Unpin, entry: CacheEntry) ->
     w.write_all(&header_bytes).await?;
 
     Ok(())
+}
+
+fn format_status(status: StatusCode) -> String {
+    match status.as_u16() {
+        200..=299 => format!("\x1b[32m{}\x1b[0m", status),
+        _ => format!("\x1b[33m{}\x1b[0m", status),
+    }
 }
