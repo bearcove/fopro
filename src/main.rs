@@ -389,7 +389,7 @@ where
         );
     }
 
-    if cachable {
+    if cachable && status.is_success() {
         // Create cache entry
         let cache_entry = CacheEntry {
             header: CacheHeader {
