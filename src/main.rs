@@ -285,42 +285,52 @@ where
         panic!("nope");
     }
     let cache_key = cache_key.strip_suffix('/').unwrap_or(&cache_key);
-    tracing::info!("Cache key: {}", cache_key);
+    tracing::debug!("Cache key: {}", cache_key);
+
+    let mut cachable = true;
+    if uri.host().unwrap_or_default() == "github.com" {
+        // don't cache, probably a git clone, we don't know how to cache that yet
+        cachable = false;
+    }
+    if method != Method::GET {
+        // only cache GET requests for now
+        cachable = false;
+    }
 
     let cache_dir = std::env::current_dir()?.join(".fopro-cache");
     let cache_path_on_disk = cache_dir.join(cache_key);
-    tokio::fs::create_dir_all(cache_path_on_disk.parent().unwrap()).await?;
-    tracing::info!(
-        "Just made dir {}",
-        cache_path_on_disk.parent().unwrap().display()
-    );
 
-    match tokio::fs::File::open(&cache_path_on_disk).await {
-        Ok(mut file) => {
-            tracing::info!("Cache hit: {}", cache_key);
-            let cache_entry = read_cache_entry(&mut file).await?;
-            let mut res = Response::builder().status(cache_entry.header.response_status);
-            res.headers_mut()
-                .unwrap()
-                .extend(cache_entry.header.response_headers);
+    if cachable {
+        tokio::fs::create_dir_all(cache_path_on_disk.parent().unwrap()).await?;
 
-            let before_read = Instant::now();
+        match tokio::fs::File::open(&cache_path_on_disk).await {
+            Ok(mut file) => {
+                tracing::debug!("Cache hit: {}", cache_key);
+                let cache_entry = read_cache_entry(&mut file).await?;
+                let mut res = Response::builder().status(cache_entry.header.response_status);
+                res.headers_mut()
+                    .unwrap()
+                    .extend(cache_entry.header.response_headers);
 
-            let body = Full::new(Bytes::from(
-                tokio::fs::read(&cache_path_on_disk).await?[cache_entry.body_offset as usize..]
-                    .to_vec(),
-            ));
+                let before_read = Instant::now();
 
-            tracing::info!("Read body from cache in {:?}", before_read.elapsed());
+                let body = Full::new(Bytes::from(
+                    tokio::fs::read(&cache_path_on_disk).await?[cache_entry.body_offset as usize..]
+                        .to_vec(),
+                ));
 
-            return Ok(res.body(body).unwrap());
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Cache miss, continue with the original request
-        }
-        Err(e) => {
-            // Unexpected error
-            return Err(e.into());
+                let read_elapsed = before_read.elapsed();
+                tracing::info!("\x1b[32m[HIT!]\x1b[0m {method} {uri} (read {read_elapsed:?})");
+
+                return Ok(res.body(body).unwrap());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Cache miss, continue with the original request
+            }
+            Err(e) => {
+                // Unexpected error
+                return Err(e.into());
+            }
         }
     }
 
@@ -365,40 +375,36 @@ where
     };
 
     let body_elapsed = before_body.elapsed();
-    tracing::info!("Proxied {method} {uri} (headers {headers_elapsed:?} + body {body_elapsed:?})");
+    tracing::info!(
+        "\x1b[31m[MISS]\x1b[0m {method} {uri} (headers {headers_elapsed:?} + body {body_elapsed:?})"
+    );
 
-    // Measure caching time
-    let cache_start = Instant::now();
+    if cachable {
+        // Create cache entry
+        let cache_entry = CacheEntry {
+            header: CacheHeader {
+                response_status: status,
+                response_headers: headers.clone(),
+            },
+            body_offset: 0, // This will be updated when writing
+        };
 
-    // Create cache entry
-    let cache_entry = CacheEntry {
-        header: CacheHeader {
-            response_status: status,
-            response_headers: headers.clone(),
-        },
-        body_offset: 0, // This will be updated when writing
-    };
+        // Write to a temporary file
+        let temp_file = cache_path_on_disk.with_extension("tmp");
+        let mut file = tokio::fs::File::create(&temp_file).await?;
 
-    // Write to a temporary file
-    let temp_file = cache_path_on_disk.with_extension("tmp");
-    let mut file = tokio::fs::File::create(&temp_file).await?;
+        // Write the cache entry
+        write_cache_entry(&mut file, cache_entry).await?;
 
-    // Write the cache entry
-    write_cache_entry(&mut file, cache_entry).await?;
+        // Write the body
+        file.write_all(&body).await?;
 
-    // Write the body
-    file.write_all(&body).await?;
+        // Ensure all data is written to disk
+        file.flush().await?;
 
-    // Ensure all data is written to disk
-    file.flush().await?;
-
-    // Rename the temporary file to the final cache file
-    tracing::info!("Just wrote temp file {}", temp_file.display(),);
-    tracing::info!("Will rename to {}", cache_path_on_disk.display());
-    tokio::fs::rename(temp_file, cache_path_on_disk).await?;
-
-    let cache_duration = cache_start.elapsed();
-    tracing::info!("Cached response for {} in {:?}", cache_key, cache_duration);
+        // Rename the temporary file to the final cache file
+        tokio::fs::rename(temp_file, cache_path_on_disk).await?;
+    }
 
     let mut res = Response::builder().status(status);
     res.headers_mut().unwrap().extend(headers);
