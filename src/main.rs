@@ -327,39 +327,54 @@ where
         cachable = false;
     }
 
+    if part.headers.contains_key(hyper::header::AUTHORIZATION) {
+        cachable = false;
+    }
+
     let cache_dir = std::env::current_dir()?.join(".fopro-cache");
     let cache_path_on_disk = cache_dir.join(cache_key);
 
     if cachable {
+        enum Source {
+            Memory,
+            Disk,
+            Unknown,
+        }
+
+        let mut source = Source::Unknown;
         let mut maybe_entry_and_body: Option<(CacheEntry, Bytes)> = {
             let entries = imch.entries.lock().unwrap();
             entries.get(cache_key).cloned()
         };
 
-        tokio::fs::create_dir_all(cache_path_on_disk.parent().unwrap()).await?;
+        if maybe_entry_and_body.is_some() {
+            source = Source::Memory;
+        } else {
+            match tokio::fs::File::open(&cache_path_on_disk).await {
+                Ok(mut file) => {
+                    source = Source::Disk;
 
-        match tokio::fs::File::open(&cache_path_on_disk).await {
-            Ok(mut file) => {
-                tracing::debug!("Cache hit: {}", cache_key);
-                let cache_entry = read_cache_entry(&mut file).await?;
-                let body = tokio::fs::read(&cache_path_on_disk).await?
-                    [cache_entry.body_offset as usize..]
-                    .to_vec();
-                let body = Bytes::from(body);
+                    tracing::debug!("Cache hit: {}", cache_key);
+                    let cache_entry = read_cache_entry(&mut file).await?;
+                    let body = tokio::fs::read(&cache_path_on_disk).await?
+                        [cache_entry.body_offset as usize..]
+                        .to_vec();
+                    let body = Bytes::from(body);
 
-                {
-                    let mut entries = imch.entries.lock().unwrap();
-                    entries.insert(cache_key.to_string(), (cache_entry.clone(), body.clone()));
+                    {
+                        let mut entries = imch.entries.lock().unwrap();
+                        entries.insert(cache_key.to_string(), (cache_entry.clone(), body.clone()));
+                    }
+
+                    maybe_entry_and_body = Some((cache_entry, body));
                 }
-
-                maybe_entry_and_body = Some((cache_entry, body));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Cache miss, continue with the original request
-            }
-            Err(e) => {
-                // Unexpected error
-                return Err(e.into());
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Cache miss, continue with the original request
+                }
+                Err(e) => {
+                    // Unexpected error
+                    return Err(e.into());
+                }
             }
         }
 
@@ -379,7 +394,13 @@ where
             {
                 let status = cache_entry.header.response_status;
                 let status = format_status(status);
-                tracing::info!("\x1b[32m[HIT!]\x1b[0m {status} {res_size}B {method} {uri} (read {read_elapsed:?})");
+                let hit_string = match source {
+                    Source::Memory => "mHIT",
+                    Source::Disk => "dHIT",
+                    Source::Unknown => "uHIT",
+                };
+
+                tracing::info!("\x1b[32m[{hit_string}]\x1b[0m {status} {res_size}B {method} {uri} (read {read_elapsed:?})");
             }
 
             return Ok(res.body(body).unwrap());
@@ -446,6 +467,7 @@ where
         };
 
         // Write to a temporary file
+        tokio::fs::create_dir_all(cache_path_on_disk.parent().unwrap()).await?;
         let temp_file = cache_path_on_disk.with_extension("tmp");
         let mut file = tokio::fs::File::create(&temp_file).await?;
 
