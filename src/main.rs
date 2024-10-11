@@ -272,6 +272,8 @@ where
     let method = req.method().clone();
     let (part, body) = req.into_parts();
 
+    let mut cachable = true;
+
     let cache_key = format!(
         "{}{}",
         uri.host().unwrap_or_default(),
@@ -282,12 +284,11 @@ where
     let cache_key = cache_key.replace(':', "_COLON_");
     let cache_key = cache_key.replace("//", "_SLASHSLASH_");
     if cache_key.contains("..") {
-        panic!("nope");
+        cachable = false;
     }
     let cache_key = cache_key.strip_suffix('/').unwrap_or(&cache_key);
     tracing::debug!("Cache key: {}", cache_key);
 
-    let mut cachable = true;
     if uri.host().unwrap_or_default() == "github.com" {
         // don't cache, probably a git clone, we don't know how to cache that yet
         cachable = false;
