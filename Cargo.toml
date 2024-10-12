@@ -41,3 +41,8 @@ tokio-rustls = { version = "0.26.0", default-features = false, features = [
 tracing = "0.1.40"
 tracing-subscriber = "0.3.18"
 webpki-roots = "0.26.6"
+
+# The profile that 'cargo dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
