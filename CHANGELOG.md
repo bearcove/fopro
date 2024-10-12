@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1](https://github.com/bearcove/fopro/compare/v1.0.0...v1.0.1) - 2024-10-12
+
+### Other
+
+- update cargo-dist
+- Set up cargo dist
+- release
+
 ## [1.0.0](https://github.com/bearcove/fopro/releases/tag/v1.0.0) - 2024-10-12
 
 ### Other
