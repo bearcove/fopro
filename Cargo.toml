@@ -1,7 +1,14 @@
 [package]
 name = "fopro"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+authors = ["Amos Wenger <amos@bearcove.net>"]
+description = "Experimental caching HTTP forward proxy (memory+disk)"
+license = "Apache-2.0 OR MIT"
+readme = "README.md"
+repository = "https://github.com/bearcove/fopro"
+keywords = ["http", "proxy", "caching"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 byteorder = "1.5.0"
