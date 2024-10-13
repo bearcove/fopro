@@ -6,13 +6,19 @@
 
 An proof-of-concept(TM) caching HTTP forward proxy
 
-Limitations:
+## Limitations
 
   * Will only accept to negotiate http/2 over TLS (via CONNECT) right now
-  * Will serve self-signed certificates, no way to export a CA cert so it
-    can be "installed" on whichever client talks to it right now
   * Very naive rules to decide if something is cachable (see sources)
-    specifically, fopro DOES NOT RESPECT CACHE-CONTROL, VARY, ETC.
+    specifically, **fopro DOES NOT RESPECT `cache-control`, `vary`, ETC**.
   * The cache is boundless (both in memory and on disk)
+  * Responses are buffered in memory completely before being proxied
+    (instead of being streamed)
+  * Partial responses (HTTP 206) are not cached at all.
   * Really you shouldn't use fopro, it currently does the bare minimum
     to get _most_ of the [uv](https://github.com/astral-sh/uv) test suite passing.
+
+## Features
+
+  * Supports `CONNECT` requests
+  * Caches 200 responses in memory and on-disk
