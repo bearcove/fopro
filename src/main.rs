@@ -71,6 +71,9 @@ impl CertAuth {
     }
 }
 
+// just the output of the 'date' on macOS Sequoia
+static CACHE_VERSION: &str = "Sun Oct 13 22:01:32 CEST 2024";
+
 #[derive(FromArgs)]
 /// A caching HTTP forward proxy
 struct CliArgs {
@@ -122,6 +125,22 @@ async fn main() -> eyre::Result<()> {
     }
     let cache_dir = cache_dir.canonicalize()?;
     tracing::info!("📂 Will cache to {}", cache_dir.display());
+
+    let cache_version_file = cache_dir.join("cache-version.txt");
+    match fs_err::tokio::read_to_string(&cache_version_file).await {
+        Ok(version) => {
+            if version != CACHE_VERSION {
+                tracing::warn!(
+                    "🙅‍♀️ Cache version mismatch (expected {CACHE_VERSION}, got {version}), clearing cache"
+                );
+                fs_err::tokio::remove_dir_all(&cache_dir).await?;
+                fs_err::tokio::create_dir_all(&cache_dir).await?;
+            }
+        }
+        Err(_) => {
+            fs_err::tokio::write(&cache_version_file, CACHE_VERSION).await?;
+        }
+    }
 
     let settings = ProxySettings {
         client,
