@@ -45,6 +45,9 @@ tracing-subscriber = "0.3.18"
 walkdir = "2.5.0"
 webpki-roots = "0.26.6"
 
+[profile.release]
+debug = 1
+
 # The profile that 'cargo dist' will build with
 [profile.dist]
 inherits = "release"

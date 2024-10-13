@@ -1,2 +1,4 @@
 .fopro-cache
 /target
+perf.data
+profile.json
