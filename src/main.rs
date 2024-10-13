@@ -58,7 +58,7 @@ impl CertAuth {
         let path = temp_dir.join("fopro-ca.crt");
 
         tokio::fs::write(path, cert.pem()).await.unwrap();
-        tracing::info!("Wrote CA cert to /tmp/fopro-ca.crt (in PEM format)");
+        tracing::info!("Wrote CA cert to {} (in PEM format)", path.display());
 
         Self { keypair, cert }
     }
