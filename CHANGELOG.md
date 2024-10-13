@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.5](https://github.com/bearcove/fopro/compare/v1.0.4...v1.0.5) - 2024-10-13
+
+### Other
+
+- use system temp dir, which hopefully fixes things on windows
+
 ## [1.0.4](https://github.com/bearcove/fopro/compare/v1.0.3...v1.0.4) - 2024-10-13
 
 ### Other
