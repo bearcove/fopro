@@ -50,7 +50,12 @@ impl CertAuth {
         let keypair = rcgen::KeyPair::generate().unwrap();
         let cert = params.self_signed(&keypair).unwrap();
 
-        let temp_dir = std::env::temp_dir();
+        let temp_dir = if cfg!(windows) {
+            std::env::temp_dir()
+        } else {
+            std::path::PathBuf::from("/tmp")
+        };
+
         if !temp_dir.exists() {
             tracing::info!("Creating temp dir {temp_dir:?}");
             std::fs::create_dir_all(&temp_dir).unwrap();
