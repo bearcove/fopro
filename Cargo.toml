@@ -1,6 +1,6 @@
 [package]
 name = "fopro"
-version = "2.0.1"
+version = "2.0.2"
 edition = "2021"
 authors = ["Amos Wenger <amos@bearcove.net>"]
 description = "Experimental caching HTTP forward proxy (memory+disk)"
