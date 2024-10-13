@@ -6,9 +6,10 @@ use hyper::{
     server::conn,
     service::Service,
     upgrade::OnUpgrade,
-    HeaderMap, Method, Request, Response, StatusCode, Uri,
+    HeaderMap, Method, Request, Response, StatusCode,
 };
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use rcgen::DistinguishedName;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -26,6 +27,34 @@ use tokio_rustls::rustls::{pki_types::PrivateKeyDer, ServerConfig};
 use tracing_subscriber::{
     filter::Targets, layer::SubscriberExt, util::SubscriberInitExt, Layer, Registry,
 };
+
+/// Our (self-signed) certificate authority
+struct CertAuth {
+    keypair: rcgen::KeyPair,
+    cert: rcgen::Certificate,
+}
+
+impl CertAuth {
+    async fn new() -> Self {
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let mut dn = DistinguishedName::new();
+        dn.push(
+            rcgen::DnType::CommonName,
+            "DO NOT INSTALL! — fopro certificate authority (see https://github.com/bearcove/fopro)",
+        );
+        params.distinguished_name = dn;
+
+        let keypair = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&keypair).unwrap();
+
+        let path = "/tmp/fopro-ca.crt";
+        tokio::fs::write(path, cert.pem()).await.unwrap();
+        tracing::info!("Wrote CA cert to /tmp/fopro-ca.crt (in PEM format)");
+
+        Self { keypair, cert }
+    }
+}
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
@@ -56,7 +85,9 @@ async fn main() -> eyre::Result<()> {
         .build()?;
 
     let imch = Arc::new(InMemoryCache::default());
-    let service = UpgradeService { client, imch };
+    let ca = Arc::new(CertAuth::new().await);
+    let settings = ProxySettings { client, ca, imch };
+    let service = UpgradeService { settings };
 
     while let Ok((stream, remote_addr)) = ln.accept().await {
         tracing::debug!("Accepted connection from {remote_addr}");
@@ -97,8 +128,7 @@ impl std::fmt::Debug for InMemoryCache {
 
 #[derive(Clone)]
 struct UpgradeService {
-    client: reqwest::Client,
-    imch: InMemoryCacheHandle,
+    settings: ProxySettings,
 }
 
 impl<ReqBody> Service<Request<ReqBody>> for UpgradeService
@@ -110,8 +140,7 @@ where
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
     fn call(&self, req: Request<ReqBody>) -> Self::Future {
-        let client = self.client.clone();
-        let imch = self.imch.clone();
+        let settings = self.settings.clone();
 
         Box::pin(async move {
             if req.method() != Method::CONNECT {
@@ -133,11 +162,9 @@ where
                         .unwrap())
                 }
             };
-            let settings = ProxySettings { host, client };
-
             let on_upgrade = hyper::upgrade::on(req);
             tokio::spawn(async move {
-                if let Err(e) = handle_upgraded_conn(uri, on_upgrade, settings, imch).await {
+                if let Err(e) = handle_upgraded_conn(on_upgrade, host, settings).await {
                     tracing::error!("Error handling upgraded conn: {e:?}");
                 }
             });
@@ -153,25 +180,26 @@ where
 }
 
 async fn handle_upgraded_conn(
-    uri: Uri,
     on_upgrade: OnUpgrade,
+    host: String,
     settings: ProxySettings,
-    imch: InMemoryCacheHandle,
 ) -> eyre::Result<()> {
     let c = on_upgrade.await.unwrap();
     let c = TokioIo::new(c);
 
-    let host: String = uri
-        .host()
-        .ok_or_else(|| eyre::eyre!("expected host in CONNECT request"))?
-        .to_string();
-    let cert_key = rcgen::generate_simple_self_signed([host.clone()])?;
+    let mut srv_params = rcgen::CertificateParams::new(vec![host.clone()]).unwrap();
+    srv_params.is_ca = rcgen::IsCa::NoCa;
+
+    let srv_keypair = rcgen::KeyPair::generate()?;
+    let srv_cert = srv_params
+        .signed_by(&srv_keypair, &settings.ca.cert, &settings.ca.keypair)
+        .unwrap();
 
     let mut server_conf = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(
-            vec![cert_key.cert.into()],
-            PrivateKeyDer::Pkcs8(cert_key.key_pair.serialize_der().into()),
+            vec![srv_cert.into()],
+            PrivateKeyDer::Pkcs8(srv_keypair.serialize_der().into()),
         )?;
     server_conf.alpn_protocols.push(b"h2".to_vec());
 
@@ -187,7 +215,7 @@ async fn handle_upgraded_conn(
         );
     }
 
-    let service = ProxyService { settings, imch };
+    let service = ProxyService { host, settings };
     let conn = conn::http2::Builder::new(TokioExecutor::new())
         .serve_connection(TokioIo::new(tls_stream), service);
     match conn.await {
@@ -217,25 +245,27 @@ async fn handle_upgraded_conn(
 
 #[derive(Clone)]
 struct ProxySettings {
-    /// the host we're proxying to, e.g. `pypi.org`
-    host: String,
-
     /// the shared reqwest client for upstream
     client: reqwest::Client,
+
+    /// the shared certificate authority
+    ca: Arc<CertAuth>,
+
+    /// the shared in-memory cache
+    imch: InMemoryCacheHandle,
 }
 
 impl std::fmt::Debug for ProxySettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ProxySettings")
-            .field("host", &self.host)
-            .finish_non_exhaustive()
+        f.debug_struct("ProxySettings").finish_non_exhaustive()
     }
 }
 
 #[derive(Debug, Clone)]
 struct ProxyService {
+    host: String,
+
     settings: ProxySettings,
-    imch: InMemoryCacheHandle,
 }
 
 impl<ReqBody> Service<Request<ReqBody>> for ProxyService
@@ -249,11 +279,10 @@ where
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
     fn call(&self, req: Request<ReqBody>) -> Self::Future {
-        let settings = self.settings.clone();
-        let imch = self.imch.clone();
+        let this = self.clone();
 
         Box::pin(async move {
-            match proxy_request(req, settings, imch).await {
+            match this.proxy_request(req).await {
                 Ok(resp) => Ok(resp),
                 Err(e) => {
                     tracing::error!("Error proxying request: {e}");
@@ -267,231 +296,234 @@ where
     }
 }
 
-async fn proxy_request<ReqBody>(
-    req: Request<ReqBody>,
-    settings: ProxySettings,
-    imch: InMemoryCacheHandle,
-) -> Result<Response<Full<Bytes>>, eyre::Error>
-where
-    ReqBody: Body + Send + Sync + Debug + 'static,
-    <ReqBody as Body>::Data: Into<Bytes>,
-    <ReqBody as Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
-    let uri = req.uri().clone();
-    tracing::trace!(?settings, %uri, "Should proxy request");
+impl ProxyService {
+    async fn proxy_request<ReqBody>(
+        self,
+        req: Request<ReqBody>,
+    ) -> Result<Response<Full<Bytes>>, eyre::Error>
+    where
+        ReqBody: Body + Send + Sync + Debug + 'static,
+        <ReqBody as Body>::Data: Into<Bytes>,
+        <ReqBody as Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let uri = req.uri().clone();
+        tracing::trace!(settings = ?self.settings, %uri, "Should proxy request");
 
-    let uri_host = uri
-        .host()
-        .ok_or_else(|| eyre::eyre!("expected host in CONNECT request"))?;
+        let uri_host = uri
+            .host()
+            .ok_or_else(|| eyre::eyre!("expected host in CONNECT request"))?;
 
-    if uri_host != settings.host {
-        return Ok(Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(
-                Bytes::copy_from_slice(
-                    format!("expected host {settings:?}, got {uri_host}").as_bytes(),
+        if uri_host != self.host {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(
+                    Bytes::copy_from_slice(
+                        format!("expected host {}, got {uri_host}", self.host).as_bytes(),
+                    )
+                    .into(),
                 )
-                .into(),
-            )
-            .unwrap());
-    }
-
-    let before_req = Instant::now();
-
-    let method = req.method().clone();
-    let (part, body) = req.into_parts();
-
-    let mut cachable = true;
-
-    let cache_key = format!(
-        "{}{}",
-        uri.host().unwrap_or_default(),
-        uri.path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or_default()
-    );
-    let cache_key = cache_key.replace(':', "_COLON_");
-    let cache_key = cache_key.replace("//", "_SLASHSLASH_");
-    if cache_key.contains("..") {
-        cachable = false;
-    }
-    let cache_key = cache_key.strip_suffix('/').unwrap_or(&cache_key);
-    tracing::debug!("Cache key: {}", cache_key);
-
-    if uri.host().unwrap_or_default() == "github.com" {
-        // don't cache, probably a git clone, we don't know how to cache that yet
-        cachable = false;
-    }
-    if method != Method::GET {
-        // only cache GET requests for now
-        cachable = false;
-    }
-
-    if part.headers.contains_key(hyper::header::AUTHORIZATION) {
-        cachable = false;
-    }
-
-    let cache_dir = std::env::current_dir()?.join(".fopro-cache");
-    let cache_path_on_disk = cache_dir.join(cache_key);
-
-    if cachable {
-        enum Source {
-            Memory,
-            Disk,
-            Unknown,
+                .unwrap());
         }
 
-        let mut source = Source::Unknown;
-        let mut maybe_entry_and_body: Option<(CacheEntry, Bytes)> = {
-            let entries = imch.entries.lock().unwrap();
-            entries.get(cache_key).cloned()
-        };
+        let before_req = Instant::now();
 
-        if maybe_entry_and_body.is_some() {
-            source = Source::Memory;
-        } else {
-            match tokio::fs::File::open(&cache_path_on_disk).await {
-                Ok(mut file) => {
-                    source = Source::Disk;
+        let method = req.method().clone();
+        let (part, body) = req.into_parts();
 
-                    tracing::debug!("Cache hit: {}", cache_key);
-                    let cache_entry = read_cache_entry(&mut file).await?;
-                    let body = tokio::fs::read(&cache_path_on_disk).await?
-                        [cache_entry.body_offset as usize..]
-                        .to_vec();
-                    let body = Bytes::from(body);
+        let mut cachable = true;
 
-                    {
-                        let mut entries = imch.entries.lock().unwrap();
-                        entries.insert(cache_key.to_string(), (cache_entry.clone(), body.clone()));
+        let cache_key = format!(
+            "{}{}",
+            uri.host().unwrap_or_default(),
+            uri.path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or_default()
+        );
+        let cache_key = cache_key.replace(':', "_COLON_");
+        let cache_key = cache_key.replace("//", "_SLASHSLASH_");
+        if cache_key.contains("..") {
+            cachable = false;
+        }
+        let cache_key = cache_key.strip_suffix('/').unwrap_or(&cache_key);
+        tracing::debug!("Cache key: {}", cache_key);
+
+        if uri.host().unwrap_or_default() == "github.com" {
+            // don't cache, probably a git clone, we don't know how to cache that yet
+            cachable = false;
+        }
+        if method != Method::GET {
+            // only cache GET requests for now
+            cachable = false;
+        }
+
+        if part.headers.contains_key(hyper::header::AUTHORIZATION) {
+            cachable = false;
+        }
+
+        let cache_dir = std::env::current_dir()?.join(".fopro-cache");
+        let cache_path_on_disk = cache_dir.join(cache_key);
+
+        if cachable {
+            enum Source {
+                Memory,
+                Disk,
+                Unknown,
+            }
+
+            let mut source = Source::Unknown;
+            let mut maybe_entry_and_body: Option<(CacheEntry, Bytes)> = {
+                let entries = self.settings.imch.entries.lock().unwrap();
+                entries.get(cache_key).cloned()
+            };
+
+            if maybe_entry_and_body.is_some() {
+                source = Source::Memory;
+            } else {
+                match tokio::fs::File::open(&cache_path_on_disk).await {
+                    Ok(mut file) => {
+                        source = Source::Disk;
+
+                        tracing::debug!("Cache hit: {}", cache_key);
+                        let cache_entry = read_cache_entry(&mut file).await?;
+                        let body = tokio::fs::read(&cache_path_on_disk).await?
+                            [cache_entry.body_offset as usize..]
+                            .to_vec();
+                        let body = Bytes::from(body);
+
+                        {
+                            let mut entries = self.settings.imch.entries.lock().unwrap();
+                            entries
+                                .insert(cache_key.to_string(), (cache_entry.clone(), body.clone()));
+                        }
+
+                        maybe_entry_and_body = Some((cache_entry, body));
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Cache miss, continue with the original request
+                    }
+                    Err(e) => {
+                        // Unexpected error
+                        return Err(e.into());
+                    }
+                }
+            }
 
-                    maybe_entry_and_body = Some((cache_entry, body));
+            if let Some((cache_entry, body)) = maybe_entry_and_body {
+                let mut res = Response::builder().status(cache_entry.header.response_status);
+                res.headers_mut()
+                    .unwrap()
+                    .extend(cache_entry.header.response_headers);
+
+                let before_read = Instant::now();
+
+                let res_size = body.len();
+                let body = Full::new(body);
+
+                let read_elapsed = before_read.elapsed();
+
+                {
+                    let status = cache_entry.header.response_status;
+                    let status = format_status(status);
+                    let hit_string = match source {
+                        Source::Memory => "mHIT",
+                        Source::Disk => "dHIT",
+                        Source::Unknown => "uHIT",
+                    };
+
+                    tracing::info!("\x1b[32m[{hit_string}]\x1b[0m {status} {res_size}B {method} {uri} (read {read_elapsed:?})");
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Cache miss, continue with the original request
-                }
-                Err(e) => {
-                    // Unexpected error
-                    return Err(e.into());
-                }
+
+                return Ok(res.body(body).unwrap());
             }
         }
 
-        if let Some((cache_entry, body)) = maybe_entry_and_body {
-            let mut res = Response::builder().status(cache_entry.header.response_status);
-            res.headers_mut()
-                .unwrap()
-                .extend(cache_entry.header.response_headers);
+        tracing::debug!("Proxying {method} {uri}");
 
-            let before_read = Instant::now();
+        let upstream_res = match self
+            .settings
+            .client
+            .request(method.clone(), uri.to_string())
+            .body(reqwest::Body::wrap(body))
+            .headers(part.headers.clone())
+            .send()
+            .await
+        {
+            Ok(res) => res,
+            Err(e) => {
+                tracing::error!("Error sending request: {e}");
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Bytes::copy_from_slice(format!("{e}").as_bytes()).into())
+                    .unwrap());
+            }
+        };
 
-            let res_size = body.len();
-            let body = Full::new(body);
+        let headers_elapsed = before_req.elapsed();
+        tracing::debug!(?headers_elapsed, "Upstream response: {upstream_res:#?}");
 
-            let read_elapsed = before_read.elapsed();
+        let status = upstream_res.status();
+        let headers = upstream_res.headers().clone();
+
+        let before_body = Instant::now();
+
+        // collect the body as bytes
+        let body = match upstream_res.bytes().await {
+            Ok(res) => res,
+            Err(e) => {
+                tracing::error!("Error reading upstream response body: {e}");
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Bytes::copy_from_slice(format!("{e}").as_bytes()).into())
+                    .unwrap());
+            }
+        };
+        let res_size = body.len();
+
+        let body_elapsed = before_body.elapsed();
+        {
+            let status = format_status(status);
+            tracing::info!(
+                "\x1b[31m[MISS]\x1b[0m {status} {res_size}B {method} {uri} (headers {headers_elapsed:?} + body {body_elapsed:?})"
+            );
+        }
+
+        if cachable && status == StatusCode::OK {
+            // Create cache entry
+            let cache_entry = CacheEntry {
+                header: CacheHeader {
+                    response_status: status,
+                    response_headers: headers.clone(),
+                },
+                body_offset: 0, // This will be updated when writing
+            };
+
+            // Write to a temporary file
+            tokio::fs::create_dir_all(cache_path_on_disk.parent().unwrap()).await?;
+            let temp_file = cache_path_on_disk.with_extension("tmp");
+            let mut file = tokio::fs::File::create(&temp_file).await?;
+
+            // Write the cache entry
+            write_cache_entry(&mut file, cache_entry.clone()).await?;
+
+            // Write the body
+            file.write_all(&body).await?;
+
+            // Ensure all data is written to disk
+            file.flush().await?;
+
+            // Rename the temporary file to the final cache file
+            tokio::fs::rename(temp_file, cache_path_on_disk).await?;
 
             {
-                let status = cache_entry.header.response_status;
-                let status = format_status(status);
-                let hit_string = match source {
-                    Source::Memory => "mHIT",
-                    Source::Disk => "dHIT",
-                    Source::Unknown => "uHIT",
-                };
-
-                tracing::info!("\x1b[32m[{hit_string}]\x1b[0m {status} {res_size}B {method} {uri} (read {read_elapsed:?})");
+                let mut entries = self.settings.imch.entries.lock().unwrap();
+                entries.insert(cache_key.to_string(), (cache_entry.clone(), body.clone()));
             }
-
-            return Ok(res.body(body).unwrap());
         }
+
+        let mut res = Response::builder().status(status);
+        res.headers_mut().unwrap().extend(headers);
+        Ok(res.body(body.into()).unwrap())
     }
-
-    tracing::debug!("Proxying {method} {uri}");
-
-    let upstream_res = match settings
-        .client
-        .request(method.clone(), uri.to_string())
-        .body(reqwest::Body::wrap(body))
-        .headers(part.headers.clone())
-        .send()
-        .await
-    {
-        Ok(res) => res,
-        Err(e) => {
-            tracing::error!("Error sending request: {e}");
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Bytes::copy_from_slice(format!("{e}").as_bytes()).into())
-                .unwrap());
-        }
-    };
-
-    let headers_elapsed = before_req.elapsed();
-    tracing::debug!(?headers_elapsed, "Upstream response: {upstream_res:#?}");
-
-    let status = upstream_res.status();
-    let headers = upstream_res.headers().clone();
-
-    let before_body = Instant::now();
-
-    // collect the body as bytes
-    let body = match upstream_res.bytes().await {
-        Ok(res) => res,
-        Err(e) => {
-            tracing::error!("Error reading upstream response body: {e}");
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Bytes::copy_from_slice(format!("{e}").as_bytes()).into())
-                .unwrap());
-        }
-    };
-    let res_size = body.len();
-
-    let body_elapsed = before_body.elapsed();
-    {
-        let status = format_status(status);
-        tracing::info!(
-            "\x1b[31m[MISS]\x1b[0m {status} {res_size}B {method} {uri} (headers {headers_elapsed:?} + body {body_elapsed:?})"
-        );
-    }
-
-    if cachable && status == StatusCode::OK {
-        // Create cache entry
-        let cache_entry = CacheEntry {
-            header: CacheHeader {
-                response_status: status,
-                response_headers: headers.clone(),
-            },
-            body_offset: 0, // This will be updated when writing
-        };
-
-        // Write to a temporary file
-        tokio::fs::create_dir_all(cache_path_on_disk.parent().unwrap()).await?;
-        let temp_file = cache_path_on_disk.with_extension("tmp");
-        let mut file = tokio::fs::File::create(&temp_file).await?;
-
-        // Write the cache entry
-        write_cache_entry(&mut file, cache_entry.clone()).await?;
-
-        // Write the body
-        file.write_all(&body).await?;
-
-        // Ensure all data is written to disk
-        file.flush().await?;
-
-        // Rename the temporary file to the final cache file
-        tokio::fs::rename(temp_file, cache_path_on_disk).await?;
-
-        {
-            let mut entries = imch.entries.lock().unwrap();
-            entries.insert(cache_key.to_string(), (cache_entry.clone(), body.clone()));
-        }
-    }
-
-    let mut res = Response::builder().status(status);
-    res.headers_mut().unwrap().extend(headers);
-    Ok(res.body(body.into()).unwrap())
 }
 
 #[derive(Clone)]

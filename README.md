@@ -13,5 +13,6 @@ Limitations:
     can be "installed" on whichever client talks to it right now
   * Very naive rules to decide if something is cachable (see sources)
     specifically, fopro DOES NOT RESPECT CACHE-CONTROL, VARY, ETC.
+  * The cache is boundless (both in memory and on disk)
   * Really you shouldn't use fopro, it currently does the bare minimum
     to get _most_ of the [uv](https://github.com/astral-sh/uv) test suite passing.
