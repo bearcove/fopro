@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0](https://github.com/bearcove/fopro/compare/v1.0.5...v2.0.0) - 2024-10-13
+
+### Added
+
+- [**breaking**] Add CLI args via argh
+
+### Fixed
+
+- show actual path the cert was written
+
+### Other
+
+- write to /tmp/ on non-windows I suppose
+- too eager
+
 ## [1.0.5](https://github.com/bearcove/fopro/compare/v1.0.4...v1.0.5) - 2024-10-13
 
 ### Other
