@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.1](https://github.com/bearcove/fopro/compare/v2.0.0...v2.0.1) - 2024-10-13
+
+### Fixed
+
+- Version cache
+
+### Other
+
+- Build with debug symbols (some)
+- Don't constantly regenerate certs
+- version the cache
+
 ## [2.0.0](https://github.com/bearcove/fopro/compare/v1.0.5...v2.0.0) - 2024-10-13
 
 ### Added
