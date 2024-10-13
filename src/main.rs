@@ -50,7 +50,13 @@ impl CertAuth {
         let keypair = rcgen::KeyPair::generate().unwrap();
         let cert = params.self_signed(&keypair).unwrap();
 
-        let path = "/tmp/fopro-ca.crt";
+        let temp_dir = std::env::temp_dir();
+        if !temp_dir.exists() {
+            tracing::info!("Creating temp dir {temp_dir:?}");
+            std::fs::create_dir_all(&temp_dir).unwrap();
+        }
+        let path = temp_dir.join("fopro-ca.crt");
+
         tokio::fs::write(path, cert.pem()).await.unwrap();
         tracing::info!("Wrote CA cert to /tmp/fopro-ca.crt (in PEM format)");
 
