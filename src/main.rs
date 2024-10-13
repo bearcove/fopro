@@ -72,7 +72,7 @@ impl CertAuth {
 }
 
 // just the output of the 'date' on macOS Sequoia
-static CACHE_VERSION: &str = "Sun Oct 13 22:01:32 CEST 2024";
+static CACHE_VERSION: &str = "Sun Oct 13 22:09:06 CEST 2024";
 
 #[derive(FromArgs)]
 /// A caching HTTP forward proxy
@@ -120,27 +120,57 @@ async fn main() -> eyre::Result<()> {
     let ca = Arc::new(CertAuth::new().await);
 
     let cache_dir = PathBuf::from(&args.cache_dir);
-    if !cache_dir.exists() {
-        tokio::fs::create_dir_all(&cache_dir).await?;
-    }
-    let cache_dir = cache_dir.canonicalize()?;
-    tracing::info!("📂 Will cache to {}", cache_dir.display());
-
     let cache_version_file = cache_dir.join("cache-version.txt");
-    match fs_err::tokio::read_to_string(&cache_version_file).await {
-        Ok(version) => {
-            if version != CACHE_VERSION {
-                tracing::warn!(
-                    "🙅‍♀️ Cache version mismatch (expected {CACHE_VERSION}, got {version}), clearing cache"
-                );
-                fs_err::tokio::remove_dir_all(&cache_dir).await?;
-                fs_err::tokio::create_dir_all(&cache_dir).await?;
+
+    if cache_dir.exists() {
+        let mut can_use_cache_dir = true;
+
+        match fs_err::tokio::read_to_string(&cache_version_file).await {
+            Ok(version) => {
+                if version != CACHE_VERSION {
+                    tracing::warn!(
+                        "🙅‍♀️ Cache version mismatch (want {CACHE_VERSION:?}, got {version:?})"
+                    );
+                    can_use_cache_dir = false;
+                }
+            }
+            Err(_) => {
+                tracing::warn!("🙅‍♀️ Cache version file missing");
+                can_use_cache_dir = false;
             }
         }
-        Err(_) => {
-            fs_err::tokio::write(&cache_version_file, CACHE_VERSION).await?;
+
+        if can_use_cache_dir {
+            tracing::info!("📂 Will re-use cache {}", cache_dir.display());
+            let mut cache_size = 0;
+            let mut num_entries = 0;
+            for entry in walkdir::WalkDir::new(&cache_dir) {
+                let entry = entry?;
+                if entry.file_type().is_file() {
+                    cache_size += entry.metadata()?.len();
+                    num_entries += 1;
+                }
+            }
+            tracing::info!(
+                "📊 Cache stats: {} entries, {} bytes total",
+                num_entries,
+                cache_size
+            );
+        } else {
+            tracing::warn!(
+                "🧹 Cache dir {} is not usable, clearing",
+                cache_dir.display()
+            );
+            fs_err::tokio::remove_dir_all(&cache_dir).await?;
         }
     }
+
+    if !cache_dir.exists() {
+        fs_err::create_dir_all(&cache_dir)?;
+        fs_err::tokio::write(&cache_version_file, CACHE_VERSION).await?;
+        tracing::info!("✨ A new cache is born, at {}", cache_dir.display());
+    }
+    let cache_dir = cache_dir.canonicalize()?;
 
     let settings = ProxySettings {
         client,
@@ -409,7 +439,7 @@ impl ProxyService {
         let mut cachable = true;
 
         let cache_key = format!(
-            "{}{}",
+            "k/{}{}",
             uri.authority().map(|a| a.as_str()).unwrap_or_default(),
             uri.path_and_query()
                 .map(|pq| pq.as_str())
