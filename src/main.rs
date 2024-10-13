@@ -621,11 +621,6 @@ impl ProxyService {
             cachable = false;
         }
 
-        if part.headers.contains_key(hyper::header::AUTHORIZATION) {
-            tracing::debug!("Not caching request with authorization header");
-            cachable = false;
-        }
-
         let cache_path_on_disk = self.settings.cache_dir.join(&cache_key);
 
         if cachable {
