@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.4](https://github.com/bearcove/fopro/compare/v1.0.3...v1.0.4) - 2024-10-13
+
+### Other
+
+- Enable nodelay
+
 ## [1.0.3](https://github.com/bearcove/fopro/compare/v1.0.2...v1.0.3) - 2024-10-13
 
 ### Other
