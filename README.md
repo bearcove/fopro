@@ -8,7 +8,6 @@ An proof-of-concept(TM) caching HTTP forward proxy
 
 ## Limitations
 
-  * Will only accept to negotiate http/2 over TLS (via CONNECT) right now
   * Very naive rules to decide if something is cachable (see sources)
     specifically, **fopro DOES NOT RESPECT `cache-control`, `vary`, ETC**.
   * The cache is boundless (both in memory and on disk)

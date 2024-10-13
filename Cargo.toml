@@ -24,6 +24,7 @@ hyper = { version = "1.4.1", default-features = false, features = [
     "server",
 ] }
 hyper-util = { version = "0.1.9", features = ["tokio"] }
+md5 = "0.7.0"
 postcard = { version = "1.0.10", features = ["use-std"] }
 pretty-hex = "0.4.1"
 rcgen = { version = "0.13.1" }
