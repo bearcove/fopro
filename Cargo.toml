@@ -11,6 +11,7 @@ keywords = ["http", "proxy", "caching"]
 categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
+argh = "0.1.12"
 byteorder = "1.5.0"
 color-eyre = "0.6.3"
 fs-err = { version = "2.11.0", features = ["tokio"] }

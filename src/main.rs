@@ -1,3 +1,4 @@
+use argh::FromArgs;
 use color_eyre::eyre::{self, Context};
 use futures_util::future::BoxFuture;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
@@ -16,6 +17,7 @@ use std::{
     convert::Infallible,
     fmt::Debug,
     net::IpAddr,
+    path::PathBuf,
     str::FromStr,
     sync::{Arc, Mutex},
     time::Instant,
@@ -63,15 +65,32 @@ impl CertAuth {
         let path = temp_dir.join("fopro-ca.crt");
 
         tokio::fs::write(&path, cert.pem()).await.unwrap();
-        tracing::info!("Wrote CA cert to {} (in PEM format)", path.display());
+        tracing::info!("🔏 Wrote CA cert to {} (in PEM format)", path.display());
 
         Self { keypair, cert }
     }
 }
 
+#[derive(FromArgs)]
+/// A caching HTTP forward proxy
+struct CliArgs {
+    /// port to listen on
+    #[argh(option, short = 'p', default = "8080")]
+    port: u16,
+
+    /// host to bind to
+    #[argh(option, short = 'h', default = "String::from(\"127.0.0.1\")")]
+    host: String,
+
+    /// directory to store cache files
+    #[argh(option, short = 'c', default = "String::from(\".fopro-cache\")")]
+    cache_dir: String,
+}
+
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
+    let args: CliArgs = argh::from_env();
 
     let rust_log_var = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     let log_filter = Targets::from_str(&rust_log_var)?;
@@ -83,13 +102,10 @@ async fn main() -> eyre::Result<()> {
                 .with_filter(log_filter),
         )
         .init();
-    tracing::debug!("Debug logging is enabled");
+    tracing::debug!("🐛 Debug logging is enabled");
 
-    let host = "127.0.0.1";
-    let port = 8080;
-
-    let ln = TcpListener::bind(format!("{host}:{port}")).await?;
-    tracing::info!("Listening on {host}:{port}");
+    let ln = TcpListener::bind(format!("{}:{}", args.host, args.port)).await?;
+    tracing::info!("🦊 Listening on {}:{}", args.host, args.port);
 
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -99,7 +115,20 @@ async fn main() -> eyre::Result<()> {
 
     let imch = Arc::new(InMemoryCache::default());
     let ca = Arc::new(CertAuth::new().await);
-    let settings = ProxySettings { client, ca, imch };
+
+    let cache_dir = PathBuf::from(&args.cache_dir);
+    if !cache_dir.exists() {
+        tokio::fs::create_dir_all(&cache_dir).await?;
+    }
+    let cache_dir = cache_dir.canonicalize()?;
+    tracing::info!("📂 Will cache to {}", cache_dir.display());
+
+    let settings = ProxySettings {
+        client,
+        ca,
+        imch,
+        cache_dir,
+    };
     let service = UpgradeService { settings };
 
     while let Ok((stream, remote_addr)) = ln.accept().await {
@@ -283,6 +312,9 @@ struct ProxySettings {
 
     /// the shared in-memory cache
     imch: InMemoryCacheHandle,
+
+    /// the cache directory
+    cache_dir: PathBuf,
 }
 
 impl std::fmt::Debug for ProxySettings {
@@ -400,8 +432,7 @@ impl ProxyService {
             cachable = false;
         }
 
-        let cache_dir = std::env::current_dir()?.join(".fopro-cache");
-        let cache_path_on_disk = cache_dir.join(&cache_key);
+        let cache_path_on_disk = self.settings.cache_dir.join(&cache_key);
 
         if cachable {
             enum Source {
