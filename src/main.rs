@@ -92,6 +92,8 @@ async fn main() -> eyre::Result<()> {
     let service = UpgradeService { settings };
 
     while let Ok((stream, remote_addr)) = ln.accept().await {
+        stream.set_nodelay(true).unwrap();
+
         tracing::debug!("Accepted connection from {remote_addr}");
         let service = service.clone();
         tokio::spawn(async move {
